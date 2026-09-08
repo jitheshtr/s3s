@@ -3758,6 +3758,7 @@ mod bodyless_content_length_tests {
     const REGION: &str = "us-east-1";
     const SERVICE: &str = "s3";
     const EMPTY_SHA256: &str = s3s_sigv4::EMPTY_STRING_SHA256_HASH;
+    const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 
     #[derive(Default)]
     struct TestS3 {
@@ -3767,6 +3768,7 @@ mod bodyless_content_length_tests {
         copy_object: AtomicUsize,
         upload_part_copy: AtomicUsize,
         put_object: AtomicUsize,
+        upload_part: AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -3818,6 +3820,14 @@ mod bodyless_content_length_tests {
             self.put_object.fetch_add(1, Ordering::SeqCst);
             Ok(S3Response::new(crate::dto::PutObjectOutput::default()))
         }
+
+        async fn upload_part(
+            &self,
+            _req: crate::S3Request<crate::dto::UploadPartInput>,
+        ) -> crate::error::S3Result<S3Response<crate::dto::UploadPartOutput>> {
+            self.upload_part.fetch_add(1, Ordering::SeqCst);
+            Ok(S3Response::new(crate::dto::UploadPartOutput::default()))
+        }
     }
 
     impl TestS3 {
@@ -3859,45 +3869,53 @@ mod bodyless_content_length_tests {
         }
     }
 
-    fn sign_request(method: &Method, uri: &Uri, payload_sha256: &str) -> String {
+    fn sign_request(method: &Method, uri: &Uri, payload_sha256: &str, extra_headers: &[(&'static str, &'static str)]) -> String {
         let amz_date = s3s_sigv4::AmzDate::parse(AMZ_DATE).unwrap();
         let amz_date_str = amz_date.fmt_iso8601();
         let host = uri.authority().expect("test URI has authority").as_str();
         let qs = uri.query().map(OrderedQs::parse).transpose().unwrap();
         let empty_query = &[] as &[(String, String)];
         let query = qs.as_ref().map_or(empty_query, AsRef::as_ref);
-        let signed_headers = [
+        let mut signed_headers = vec![
             ("host", host),
             ("x-amz-content-sha256", payload_sha256),
             ("x-amz-date", amz_date_str.as_str()),
         ];
+        signed_headers.extend(extra_headers.iter().copied());
+        signed_headers.sort_unstable_by(|lhs, rhs| lhs.0.cmp(rhs.0));
+        let signed_header_names = signed_headers.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(";");
+        let payload = if payload_sha256 == UNSIGNED_PAYLOAD {
+            s3s_sigv4::Payload::Unsigned
+        } else {
+            s3s_sigv4::Payload::SingleChunk(payload_sha256)
+        };
 
-        let canonical_request = s3s_sigv4::create_canonical_request(
-            method.as_str(),
-            uri.path(),
-            query,
-            signed_headers,
-            s3s_sigv4::Payload::SingleChunk(payload_sha256),
-        );
+        let canonical_request = s3s_sigv4::create_canonical_request(method.as_str(), uri.path(), query, signed_headers, payload);
         let string_to_sign = s3s_sigv4::create_string_to_sign(&canonical_request, &amz_date, REGION, SERVICE);
         let signature = s3s_sigv4::calculate_signature(&string_to_sign, SECRET_KEY, &amz_date, REGION, SERVICE);
 
         format!(
             "AWS4-HMAC-SHA256 Credential={ACCESS_KEY}/{}/{REGION}/{SERVICE}/aws4_request, \
-             SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={}",
+             SignedHeaders={signed_header_names}, Signature={}",
             amz_date.fmt_date(),
             signature.as_str()
         )
     }
 
-    fn signed_request(method: Method, version: Version, uri: &str, extra_headers: &[(&'static str, &'static str)]) -> Request {
+    fn signed_request(
+        method: Method,
+        version: Version,
+        uri: &str,
+        payload_sha256: &'static str,
+        extra_headers: &[(&'static str, &'static str)],
+    ) -> Request {
         let uri = uri.parse::<Uri>().unwrap();
-        let authorization = sign_request(&method, &uri, EMPTY_SHA256);
+        let authorization = sign_request(&method, &uri, payload_sha256, extra_headers);
         let mut builder = hyper::Request::builder()
             .method(method)
             .version(version)
             .uri(uri.clone())
-            .header(crate::header::X_AMZ_CONTENT_SHA256, EMPTY_SHA256)
+            .header(crate::header::X_AMZ_CONTENT_SHA256, payload_sha256)
             .header(crate::header::X_AMZ_DATE, AMZ_DATE)
             .header(crate::header::AUTHORIZATION, authorization);
 
@@ -3974,47 +3992,59 @@ mod bodyless_content_length_tests {
         let auth = SimpleAuth::from_single(ACCESS_KEY, SECRET_KEY);
         let ccx = test_context(&s3, &config, &auth);
 
-        for version in [Version::HTTP_11, Version::HTTP_2] {
-            for case in &cases {
-                let before = case.calls(&test_s3);
-                let mut req = signed_request(case.method.clone(), version, case.uri, case.extra_headers);
-                assert!(req.headers.get(hyper::header::CONTENT_LENGTH).is_none());
+        for payload_sha256 in [EMPTY_SHA256, UNSIGNED_PAYLOAD] {
+            for version in [Version::HTTP_11, Version::HTTP_2] {
+                for case in &cases {
+                    let before = case.calls(&test_s3);
+                    let mut req = signed_request(case.method.clone(), version, case.uri, payload_sha256, case.extra_headers);
+                    assert!(req.headers.get(hyper::header::CONTENT_LENGTH).is_none());
 
-                let response = super::call(&mut req, &ccx).await.unwrap();
-                assert!(
-                    response.status.is_success(),
-                    "{} over {version:?} should succeed without Content-Length, got {:?}",
-                    case.name,
-                    response.status
-                );
-                assert_eq!(case.calls(&test_s3), before + 1, "{} handler should be invoked", case.name);
+                    let response = super::call(&mut req, &ccx).await.unwrap();
+                    assert!(
+                        response.status.is_success(),
+                        "{} with {payload_sha256} over {version:?} should succeed without Content-Length, got {:?}",
+                        case.name,
+                        response.status
+                    );
+                    assert_eq!(case.calls(&test_s3), before + 1, "{} handler should be invoked", case.name);
+                }
             }
         }
 
-        assert_eq!(test_s3.total_bodyless_calls(), cases.len() * 2);
+        assert_eq!(test_s3.total_bodyless_calls(), cases.len() * 4);
     }
 
     #[tokio::test]
-    async fn signed_put_object_still_rejects_missing_content_length() {
+    async fn signed_upload_operations_still_reject_missing_content_length() {
         let test_s3 = Arc::new(TestS3::default());
         let s3: Arc<dyn crate::s3_trait::S3> = test_s3.clone();
         let config = test_config();
         let auth = SimpleAuth::from_single(ACCESS_KEY, SECRET_KEY);
         let ccx = test_context(&s3, &config, &auth);
 
-        for version in [Version::HTTP_11, Version::HTTP_2] {
-            let mut req = signed_request(Method::PUT, version, "http://localhost/test-bucket/test-key.txt", &[]);
-            assert!(req.headers.get(hyper::header::CONTENT_LENGTH).is_none());
+        let cases = [
+            ("PutObject", "http://localhost/test-bucket/test-key.txt"),
+            ("UploadPart", "http://localhost/test-bucket/test-key.txt?partNumber=1&uploadId=upload-id"),
+        ];
 
-            let response = super::call(&mut req, &ccx).await.unwrap();
-            assert_eq!(
-                response.status,
-                StatusCode::LENGTH_REQUIRED,
-                "PutObject over {version:?} must still require Content-Length"
-            );
+        for payload_sha256 in [EMPTY_SHA256, UNSIGNED_PAYLOAD] {
+            for version in [Version::HTTP_11, Version::HTTP_2] {
+                for (name, uri) in cases {
+                    let mut req = signed_request(Method::PUT, version, uri, payload_sha256, &[]);
+                    assert!(req.headers.get(hyper::header::CONTENT_LENGTH).is_none());
+
+                    let response = super::call(&mut req, &ccx).await.unwrap();
+                    assert_eq!(
+                        response.status,
+                        StatusCode::LENGTH_REQUIRED,
+                        "{name} with {payload_sha256} over {version:?} must still require Content-Length"
+                    );
+                }
+            }
         }
 
         assert_eq!(test_s3.put_object.load(Ordering::SeqCst), 0);
+        assert_eq!(test_s3.upload_part.load(Ordering::SeqCst), 0);
     }
 
     struct ContentLengthRecordingS3 {
@@ -4040,7 +4070,7 @@ mod bodyless_content_length_tests {
 
     fn empty_body_signed_put(version: Version) -> Request {
         let uri = "http://localhost/test-bucket/test-key.txt".parse::<Uri>().unwrap();
-        let authorization = sign_request(&Method::PUT, &uri, EMPTY_SHA256);
+        let authorization = sign_request(&Method::PUT, &uri, EMPTY_SHA256, &[]);
         Request::from(
             hyper::Request::builder()
                 .method(Method::PUT)
@@ -4142,14 +4172,26 @@ mod bodyless_content_length_tests {
         let auth = SimpleAuth::from_single(ACCESS_KEY, SECRET_KEY);
         let ccx = test_context(&s3, &config, &auth);
 
-        let mut malformed = signed_request(Method::GET, Version::HTTP_11, "http://localhost/test-bucket/test-key.txt", &[]);
+        let mut malformed = signed_request(
+            Method::GET,
+            Version::HTTP_11,
+            "http://localhost/test-bucket/test-key.txt",
+            EMPTY_SHA256,
+            &[],
+        );
         malformed
             .headers
             .insert(hyper::header::CONTENT_LENGTH, hyper::header::HeaderValue::from_static("not-a-number"));
         let response = super::call(&mut malformed, &ccx).await.unwrap();
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
 
-        let mut overflowing = signed_request(Method::GET, Version::HTTP_11, "http://localhost/test-bucket/test-key.txt", &[]);
+        let mut overflowing = signed_request(
+            Method::GET,
+            Version::HTTP_11,
+            "http://localhost/test-bucket/test-key.txt",
+            EMPTY_SHA256,
+            &[],
+        );
         overflowing.headers.insert(
             hyper::header::CONTENT_LENGTH,
             hyper::header::HeaderValue::from_static("184467440737095516160"),
@@ -4157,7 +4199,13 @@ mod bodyless_content_length_tests {
         let response = super::call(&mut overflowing, &ccx).await.unwrap();
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
 
-        let mut duplicate = signed_request(Method::GET, Version::HTTP_11, "http://localhost/test-bucket/test-key.txt", &[]);
+        let mut duplicate = signed_request(
+            Method::GET,
+            Version::HTTP_11,
+            "http://localhost/test-bucket/test-key.txt",
+            EMPTY_SHA256,
+            &[],
+        );
         duplicate
             .headers
             .append(hyper::header::CONTENT_LENGTH, hyper::header::HeaderValue::from_static("0"));
@@ -4178,7 +4226,13 @@ mod bodyless_content_length_tests {
         let auth = SimpleAuth::from_single(ACCESS_KEY, SECRET_KEY);
         let ccx = test_context(&s3, &config, &auth);
 
-        let mut req = signed_request(Method::GET, Version::HTTP_2, "http://localhost/test-bucket/test-key.txt", &[]);
+        let mut req = signed_request(
+            Method::GET,
+            Version::HTTP_2,
+            "http://localhost/test-bucket/test-key.txt",
+            EMPTY_SHA256,
+            &[],
+        );
         let authorization = req
             .headers
             .get(crate::header::AUTHORIZATION)
@@ -4211,19 +4265,12 @@ mod bodyless_content_length_tests {
         let auth = SimpleAuth::from_single(ACCESS_KEY, SECRET_KEY);
         let ccx = test_context(&s3, &config, &auth);
 
-        let uri = "http://localhost/test-bucket/test-key.txt".parse::<Uri>().unwrap();
-        let authorization = sign_request(&Method::GET, &uri, NON_EMPTY_SHA256);
-        let mut req = Request::from(
-            hyper::Request::builder()
-                .method(Method::GET)
-                .version(Version::HTTP_11)
-                .uri(uri.clone())
-                .header(crate::header::HOST, uri.authority().unwrap().as_str())
-                .header(crate::header::X_AMZ_CONTENT_SHA256, NON_EMPTY_SHA256)
-                .header(crate::header::X_AMZ_DATE, AMZ_DATE)
-                .header(crate::header::AUTHORIZATION, authorization)
-                .body(empty_unknown_length_body())
-                .unwrap(),
+        let mut req = signed_request(
+            Method::GET,
+            Version::HTTP_11,
+            "http://localhost/test-bucket/test-key.txt",
+            NON_EMPTY_SHA256,
+            &[],
         );
 
         let response = super::call(&mut req, &ccx).await.unwrap();
