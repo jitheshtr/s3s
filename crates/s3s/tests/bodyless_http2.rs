@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: 2026 The s3s Authors
+// SPDX-FileCopyrightText: 2023-2026 The s3s Authors
 
 use bytes::Bytes;
 use h2::client::SendRequest;
@@ -263,6 +263,7 @@ async fn unexpected_request_body_does_not_poison_http2_connection() {
     let mut harness = Http2Harness::start().await;
 
     let unexpected_body_response = harness.get_object(UNSIGNED_PAYLOAD, Bytes::from_static(b"unexpected")).await;
+    // Either a completed response or a stream reset safely ends this request; connection reuse is the contract under test.
     accept_response_or_stream_reset(unexpected_body_response).await;
 
     let calls_before_follow_up = harness.get_object_calls();
